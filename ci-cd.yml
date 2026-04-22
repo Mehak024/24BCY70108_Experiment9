@@ -1,21 +1,37 @@
-name: CI/CD Pipeline — React App
+name: CI/CD Pipeline
 
+# ─────────────────────────────────────────────────────────────
+# Triggers
+# ─────────────────────────────────────────────────────────────
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
+# ─────────────────────────────────────────────────────────────
+# Global env — image name derived from repo automatically
+# ─────────────────────────────────────────────────────────────
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_NAME: ${{ github.repository }}   # e.g. octocat/my-react-app
 
+# ─────────────────────────────────────────────────────────────
+# Cancel in-flight runs on the same ref so rapid pushes
+# don't queue up wastefully
+# ─────────────────────────────────────────────────────────────
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ─────────────────────────────────────────────────────────────
+# Jobs
+# ─────────────────────────────────────────────────────────────
 jobs:
-  # ──────────────────────────────────────────────
-  # Stage 1: Test (runs on every push and PR)
-  # ──────────────────────────────────────────────
-  test:
-    name: Test & Lint
+
+  # ── 1. CI: Install → Lint → Test ─────────────────────────────
+  ci:
+    name: CI — Test & Lint
     runs-on: ubuntu-latest
 
     steps:
@@ -25,50 +41,55 @@ jobs:
       - name: Set up Node.js 18
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
-          cache: 'npm'
+          node-version: "18"
+          cache: "npm"           # caches ~/.npm across runs
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci              # reproducible; faster than npm install
 
-      - name: Run ESLint
+      - name: Lint
         run: npm run lint
 
-      - name: Run Jest tests with coverage
-        run: npm test -- --coverage --watchAll=false
+      - name: Run tests with coverage
+        run: npm test -- --watchAll=false --coverage
+        env:
+          CI: true               # CRA exits code 1 on test failure
 
-      - name: Upload coverage report
-        uses: actions/upload-artifact@v4
+      - name: Upload coverage artifact
         if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: coverage-report
+          name: coverage-${{ github.run_number }}
           path: coverage/
-          retention-days: 7
+          retention-days: 14
 
-  # ──────────────────────────────────────────────
-  # Stage 2: Docker Build & Push to GHCR
-  # Only runs on push to main (not on PRs)
-  # ──────────────────────────────────────────────
-  build-and-push:
-    name: Docker Build & Push
+  # ── 2. CD: Docker Build + Push to GHCR ───────────────────────
+  # Runs only when CI passes AND this is a push to main
+  cd:
+    name: CD — Build & Push Image
     runs-on: ubuntu-latest
-    needs: test
+    needs: ci
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     permissions:
       contents: read
-      packages: write
+      packages: write            # required to push to ghcr.io
 
     outputs:
       image-digest: ${{ steps.build.outputs.digest }}
-      image-tag: ${{ steps.meta.outputs.tags }}
+      short-sha: ${{ steps.vars.outputs.short-sha }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Compute short SHA
+        id: vars
+        run: echo "short-sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        # Buildx is required for BuildKit cache export/import
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -76,52 +97,80 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+          # GITHUB_TOKEN is automatic — no manual secret needed for GHCR
 
-      - name: Extract Docker metadata (tags & labels)
+      - name: Extract image metadata (tags + OCI labels)
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            # Tag with 'latest' on push to main
+            # 'latest' on pushes to main
             type=raw,value=latest,enable={{is_default_branch}}
-            # Tag with short commit SHA (e.g. sha-a1b2c3d)
+            # Short commit SHA tag: sha-a1b2c3d
             type=sha,prefix=sha-,format=short
+            # Semver tags when you push a git tag like v1.2.3
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
 
       - name: Build and push Docker image
         id: build
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: ./Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Use GitHub Actions cache for faster builds
+          # GitHub Actions layer cache — dramatically speeds up rebuilds
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Uncomment if you need build-time env vars:
+          # build-args: |
+          #   REACT_APP_API_URL=${{ vars.REACT_APP_API_URL }}
 
-  # ──────────────────────────────────────────────
-  # Stage 3: Slack Notification on Success
-  # ──────────────────────────────────────────────
-  notify:
-    name: Slack Notification
+      - name: Write job summary
+        run: |
+          echo "### Docker image pushed :whale:" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Key | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Registry | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Tags | \`latest\`, \`sha-${{ steps.vars.outputs.short-sha }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Digest | \`${{ steps.build.outputs.digest }}\` |" >> "$GITHUB_STEP_SUMMARY"
+
+  # ── 3. Slack — Success ────────────────────────────────────────
+  notify-success:
+    name: Notify Slack — Success
     runs-on: ubuntu-latest
-    needs: build-and-push
+    needs: cd
     if: success()
 
     steps:
-      - name: Send Slack notification
+      - name: Send success notification
         uses: slackapi/slack-github-action@v1.26.0
         with:
           payload: |
             {
-              "text": ":rocket: *Deployment successful!*",
+              "text": ":white_check_mark: Deployment succeeded",
               "blocks": [
+                {
+                  "type": "header",
+                  "text": { "type": "plain_text", "text": ":white_check_mark:  Deployment successful" }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    { "type": "mrkdwn", "text": "*Repo*\n`${{ github.repository }}`" },
+                    { "type": "mrkdwn", "text": "*Branch*\n`${{ github.ref_name }}`" },
+                    { "type": "mrkdwn", "text": "*Commit*\n`${{ needs.cd.outputs.short-sha }}`" },
+                    { "type": "mrkdwn", "text": "*Actor*\n${{ github.actor }}" }
+                  ]
+                },
                 {
                   "type": "section",
                   "text": {
                     "type": "mrkdwn",
-                    "text": ":rocket: *Deployment successful!*\n*Repo:* ${{ github.repository }}\n*Branch:* `${{ github.ref_name }}`\n*Commit:* `${{ github.sha }}`\n*Deployed by:* ${{ github.actor }}"
+                    "text": "*Image*\n`ghcr.io/${{ github.repository }}:sha-${{ needs.cd.outputs.short-sha }}`"
                   }
                 },
                 {
@@ -129,7 +178,53 @@ jobs:
                   "elements": [
                     {
                       "type": "button",
-                      "text": { "type": "plain_text", "text": "View Run" },
+                      "text": { "type": "plain_text", "text": "View run" },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+  # ── 4. Slack — Failure ────────────────────────────────────────
+  # Fires if ci OR cd fails on a push to main
+  notify-failure:
+    name: Notify Slack — Failure
+    runs-on: ubuntu-latest
+    needs: [ci, cd]
+    if: failure() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Send failure notification
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": ":x: Pipeline failed",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": { "type": "plain_text", "text": ":x:  Pipeline failed" }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    { "type": "mrkdwn", "text": "*Repo*\n`${{ github.repository }}`" },
+                    { "type": "mrkdwn", "text": "*Branch*\n`${{ github.ref_name }}`" },
+                    { "type": "mrkdwn", "text": "*Commit*\n`${{ github.sha }}`" },
+                    { "type": "mrkdwn", "text": "*Actor*\n${{ github.actor }}" }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "style": "danger",
+                      "text": { "type": "plain_text", "text": "Investigate" },
                       "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
                     }
                   ]
